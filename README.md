@@ -1,4 +1,4 @@
-# mpow
+# Minimal Proof of Work
 🚀 Minimal Proof of Work ⛏️ 🦀 Written in Rust | 🐳 Dockerized
 ### How it Works:
 ```mermaid
