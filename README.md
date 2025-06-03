@@ -2,21 +2,34 @@
 🚀 Minimal Proof of Work ⛏️ 🦀 Written in Rust | 🐳 Dockerized
 ```mermaid
 sequenceDiagram
-  participant User as User (Browser)
-  participant Server as mpow (HTTP)
+  participant Browser as Browser
+  participant Server as Minimal Proof of Work
+  participant Store as ChallengeStore (HashMap<IpAddr, PowChallenge>)
 
-  User ->> Server: GET /<br>
-  Server -->> User: Returns HTML + JS (template rendered by Rust)
-  User ->> User: JS starts computing PoW (challenge + nonce loop)
-  loop Finding valid nonce
-    User ->> User: hash(challenge + nonce) until valid
+  Browser ->> Server: GET /
+  Server ->> Store: Validate `pow_token` cookie (via IP or token match)
+  alt Cookie is valid
+    Server -->> Browser: Return HTML (Access Granted)
+  else Cookie missing or invalid
+    Server ->> Store: Lookup challenge by IP
+    alt Valid challenge exists
+      Server -->> Browser: Return HTML + JS with existing challenge
+    else No challenge or expired
+      Server ->> Store: Remove old challenge (if any)
+      Server ->> Store: Insert new PowChallenge for IP
+      Server -->> Browser: Return HTML + JS with new challenge
+    end
   end
-  User ->> Server: POST /verify { challenge, nonce }
-  alt Valid PoW
-    Server -->> User: 200 OK + access token
-    User ->> User: Show “Access Granted”
-  else Invalid
-    Server -->> User: 403 Forbidden
-    User ->> User: Show “Try Again”
+
+  Browser ->> Browser: JS solves challenge (finds valid nonce)
+  Browser ->> Server: POST / with { nonce }
+
+  Server ->> Store: Lookup challenge by IP
+  alt Valid challenge and valid nonce
+    Server ->> Store: Remove challenge
+    Server -->> Browser: Set `pow_token` cookie (36h), return 200 OK
+  else Invalid or missing challenge/nonce
+    Server -->> Browser: Return 403 Forbidden
   end
+
 ```
