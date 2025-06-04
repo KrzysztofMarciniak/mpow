@@ -1,5 +1,9 @@
 # Minimal Proof of Work
-🚀 Minimal Proof of Work ⛏️ 🦀 Written in Rust | 🐳 Dockerized
+🚀 Minimal Proof of Work ⛏️ 🦀 Written in Rust 
+
+![screenshot](screenshot.png)
+
+
 ### How it Works:
 ```mermaid
 sequenceDiagram
@@ -37,33 +41,23 @@ sequenceDiagram
 ### Request Handling Flow:
 ```mermaid
 graph TD
-  A[Incoming HTTP Request] --> S[sanitize_cookie]
-  S -->|Valid| B[get_handler]
-  S -->|Valid| C[post_handler]
-  S -->|Invalid| X[return_400_bad_request]
-
-  subgraph GET Flow
-    B --> D[validate_pow_token_cookie]
-    D -->|Valid| E[return_access_granted_html]
-    D -->|Invalid| F[lookup_challenge_by_ip]
-    F -->|Challenge exists and valid| G[return_html_with_existing_challenge]
-    F -->|No challenge or expired| H[remove_old_challenge_if_any]
-    H --> I[insert_new_pow_challenge_for_ip]
-    I --> J[return_html_with_new_challenge]
-  end
-
-  subgraph POST Flow
-    C --> O["sanitize_post_body_nonce"]
-    O --> K[lookup_challenge_by_ip]
-    K -->|Valid challenge and nonce| L[remove_challenge_from_store]
-    L --> M["set_pow_token_cookie_36h_and_return_200"]
-    K -->|Invalid challenge or nonce| N[return_403_forbidden]
-  end
-
+  A[Incoming HTTP Request] --> B[Check Request Method]
+  
+  B -->|GET| C[sanitize_cookie]
+  C -->|Valid| D[return_access_granted_html]
+  C -->|Invalid| E[lookup_challenge_by_ip]
+  E -->|Challenge valid| F[return_html_with_existing_challenge]
+  E -->|Challenge missing or expired| G[create_new_challenge_and_return]
+  
+  B -->|POST| H[sanitize_post_body_nonce]
+  H --> I[lookup_challenge_by_ip]
+  I -->|Valid challenge and nonce| J[remove_challenge_and_set_cookie_return_200]
+  I -->|Invalid challenge or nonce| K[return_403_forbidden]
+  
   subgraph Optional Logging
-    B --> P{is_loki_logging_enabled?}
-    C --> P
-    P -->|Yes| Q[send_logs_to_loki]
-    P -->|No| R[skip_logging]
+    C --> L{is_loki_logging_enabled?}
+    H --> L
+    L -->|Yes| M[send_logs_to_loki]
+    L -->|No| N[skip_logging]
   end
 ```
