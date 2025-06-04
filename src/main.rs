@@ -4,20 +4,25 @@ use actix_web::{
     guard, web, App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use futures_util::future::{LocalBoxFuture, ready, Ready};
-use rand::{RngCore};
+use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     rc::Rc,
+    sync::Arc,
 };
 use tokio::sync::Mutex;
+use tokio::spawn;
 use time::{Duration, OffsetDateTime};
 use tracing::{error, info, warn};
-use std::sync::Arc;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use tracing_loki::builder;
+use tracing_subscriber::{layer::SubscriberExt, Registry};
+use url::Url;
 
+const USE_LOKI: bool = false;  // loki 
 mod html; // html template rendering
 
 const COOKIE_NAME: &str = "mpow_token";
@@ -111,7 +116,6 @@ async fn issue_new_token(state: &web::Data<AppState>) -> (String, Cookie<'static
 
     (token, cookie)
 }
-
 
 pub struct CookieSanitizer;
 
@@ -380,7 +384,28 @@ pub async fn post_handler(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Initialize tracing subscriber conditionally with or without Loki
+    if USE_LOKI {
+        let loki_endpoint = Url::parse("http://localhost:3100/loki/api/v1/push")
+        .expect("Invalid Loki endpoint URL");
+    
+        let (loki_layer, loki_task) = builder()
+            .label("app", "mpow_server")
+            .unwrap()
+            .build_url(loki_endpoint)
+            .unwrap();
+
+        let subscriber = Registry::default()
+            .with(loki_layer)
+            .with(tracing_subscriber::fmt::layer());
+
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Failed to set global subscriber");
+
+        spawn(loki_task);
+    } else {
+        tracing_subscriber::fmt::init();
+    }
 
     let app_state = web::Data::new(AppState::new());
 

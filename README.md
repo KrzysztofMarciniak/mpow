@@ -1,8 +1,8 @@
 # Minimal Proof of Work
 🚀 Minimal Proof of Work ⛏️ 🦀 Written in Rust 
 
-![screenshot](screenshot.png)
-
+![solving](solving.png)
+![solved](solved.png)
 
 ### How it Works:
 ```mermaid
