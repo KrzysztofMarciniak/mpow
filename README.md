@@ -7,57 +7,57 @@
 ### How it Works:
 ```mermaid
 sequenceDiagram
-  participant Browser as Browser
-  participant Server as Minimal Proof of Work
-  participant Store as ChallengeStore (HashMap<IpAddr, PowChallenge>)
+    participant User
+    participant Server
 
-  Browser ->> Server: GET /
-  Server ->> Store: Validate `pow_token` cookie (via IP or token match)
-  alt Cookie is valid
-    Server -->> Browser: Return HTML (Access Granted)
-  else Cookie missing or invalid
-    Server ->> Store: Lookup challenge by IP
-    alt Valid challenge exists
-      Server -->> Browser: Return HTML + JS with existing challenge
-    else No challenge or expired
-      Server ->> Store: Remove old challenge (if any)
-      Server ->> Store: Insert new PowChallenge for IP
-      Server -->> Browser: Return HTML + JS with new challenge
+    User->>Server: GET /
+    Server-->>User: HTML PoW Challenge (if no valid token)
+    alt Token is valid
+        Server-->>User: Redirect (e.g. to Google)
     end
-  end
 
-  Browser ->> Browser: JS solves challenge (finds valid nonce)
-  Browser ->> Server: POST / with { nonce }
-
-  Server ->> Store: Lookup challenge by IP
-  alt Valid challenge and valid nonce
-    Server ->> Store: Remove challenge
-    Server -->> Browser: Set `pow_token` cookie (36h), return 200 OK
-  else Invalid or missing challenge/nonce
-    Server -->> Browser: Return 403 Forbidden
-  end
+    User->>Server: POST / (nonce submission)
+    alt Nonce valid
+        Server-->>User: "PoW verified, access granted" + Set-Cookie
+    else Nonce invalid
+        Server-->>User: "Invalid nonce" or error
+    end
 
 ```
-### Request Handling Flow:
+### In details:
 ```mermaid
 graph TD
-  A[Incoming HTTP Request] --> B[Check Request Method]
-  
-  B -->|GET| C[sanitize_cookie]
-  C -->|Valid| D[return_access_granted_html]
-  C -->|Invalid| E[lookup_challenge_by_ip]
-  E -->|Challenge valid| F[return_html_with_existing_challenge]
-  E -->|Challenge missing or expired| G[create_new_challenge_and_return]
-  
-  B -->|POST| H[sanitize_post_body_nonce]
-  H --> I[lookup_challenge_by_ip]
-  I -->|Valid challenge and nonce| J[remove_challenge_and_set_cookie_return_200]
-  I -->|Invalid challenge or nonce| K[return_403_forbidden]
-  
-  subgraph Optional Logging
-    C --> L{is_loki_logging_enabled?}
-    H --> L
-    L -->|Yes| M[send_logs_to_loki]
-    L -->|No| N[skip_logging]
-  end
+    A[User visits /] --> B{Does request have valid cookie?}
+
+    B -- No --> C[Server issues new token]
+    C --> D[Server sets Set-Cookie header]
+    D --> E[Server generates PoW challenge]
+    E --> F[Server responds with HTML + challenge]
+
+    B -- Yes --> G{Is token marked valid?}
+    G -- No --> E
+    G -- Yes --> H[Server redirects to protected resource]
+
+    F --> I[User solves challenge with nonce]
+    I --> J[User submits nonce via POST /]
+
+    J --> K{Is token in challenge map?}
+    K -- No --> L[Respond: Forbidden – No active challenge]
+
+    K -- Yes --> M{Is challenge expired?}
+    M -- Yes --> N[Delete challenge] --> L
+
+    M -- No --> O{Too many attempts?}
+    O -- Yes --> P[Respond: 429 Too Many Requests]
+
+    O -- No --> Q[Server hashes challenge + nonce]
+    Q --> R{Hash starts with 0000?}
+
+    R -- No --> S[Respond: Forbidden – Invalid nonce]
+
+    R -- Yes --> T[Mark token as valid]
+    T --> U[Delete challenge]
+    U --> V[Set new cookie with extended expiry]
+    V --> W[Respond: OK – Access granted]
+
 ```
