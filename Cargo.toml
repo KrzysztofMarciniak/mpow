@@ -1,5 +1,5 @@
 [package]
-name = "minimal_pow"
+name = "mpow"
 version = "0.1.0"
 edition = "2021"
 
@@ -21,3 +21,7 @@ base64 = "0.21"
 hex = "0.4"
 tracing-loki = "0.2.6"
 url = "2"
+jsonwebtoken = "9"
+
+[dev-dependencies]
+anyhow = "1.0"
