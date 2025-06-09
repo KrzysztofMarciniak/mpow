@@ -133,9 +133,13 @@ mod tests {
 			_ => panic!("Expected InvalidSignature, got {:?}", err),
 		}
 	}
+	#[test]
+	fn demo_function_exists_jwt() {
+		demo_jwt();
+	}
 }
 
 /// Debug helper
-pub fn demo() {
+pub fn demo_jwt() {
 	println!("jwt module demo called");
 }

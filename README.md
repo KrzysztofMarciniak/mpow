@@ -22,7 +22,6 @@ sequenceDiagram
     else Nonce invalid
         Server-->>User: "Invalid nonce" or error
     end
-
 ```
 ### In details:
 ```mermaid

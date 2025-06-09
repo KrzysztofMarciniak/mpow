@@ -1,6 +1,9 @@
+mod html;
 mod jwt;
+mod routing;
 mod values;
 
-fn main(){
-        jwt::demo();
+#[tokio::main]
+async fn main() {
+	routing::start_server().await;
 }

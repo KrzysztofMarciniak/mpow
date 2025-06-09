@@ -86,12 +86,14 @@ progress {
   accent-color: var(--color-primary);
 }
 "#;
-
 pub const JS_SCRIPT: &str = r#"
 (async () => {
   const statusEl = document.getElementById("status");
   const progressEl = document.getElementById("progress");
-  const difficultyPrefix = "0000";
+  
+  // Detect number of CPU cores
+  const numCores = navigator.hardwareConcurrency || 4;
+  console.log(`Detected ${numCores} CPU cores`);
 
   function str2buf(str) {
     return new TextEncoder().encode(str);
@@ -104,45 +106,139 @@ pub const JS_SCRIPT: &str = r#"
       .join('');
   }
 
-  let nonce = 0;
-  const chunkSize = 1000;
+  let globalNonce = 0;
   let solved = false;
+  let totalHashes = 0;
+  const startTime = Date.now();
   progressEl.hidden = false;
 
   function updateStatus(text) {
     statusEl.textContent = text;
   }
 
-  async function solveChunk() {
-    for (let i = 0; i < chunkSize; i++) {
-      const testStr = challenge + nonce.toString();
-      const hash = await sha256hex(str2buf(testStr));
-      if (hash.startsWith(difficultyPrefix)) {
+  // Worker code as a string to create inline workers
+  const workerCode = `
+    self.onmessage = async function(e) {
+      const { challenge, difficultyPrefix, startNonce, chunkSize, workerId } = e.data;
+      
+      function str2buf(str) {
+        return new TextEncoder().encode(str);
+      }
+
+      async function sha256hex(input) {
+        const hashBuffer = await crypto.subtle.digest("SHA-256", input);
+        return Array.from(new Uint8Array(hashBuffer))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('');
+      }
+
+      let nonce = startNonce;
+      let hashes = 0;
+      
+      for (let i = 0; i < chunkSize; i++) {
+        const input = challenge + nonce.toString();
+        const hash = await sha256hex(str2buf(input));
+        hashes++;
+
+        if (hash.startsWith(difficultyPrefix)) {
+          self.postMessage({ 
+            type: 'solution', 
+            nonce: nonce, 
+            hash: hash, 
+            hashes: hashes,
+            workerId: workerId 
+          });
+          return;
+        }
+        nonce++;
+      }
+
+      self.postMessage({ 
+        type: 'progress', 
+        lastNonce: nonce, 
+        hashes: hashes,
+        workerId: workerId 
+      });
+    };
+  `;
+
+  // Create workers
+  const workers = [];
+  const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+  const workerUrl = URL.createObjectURL(workerBlob);
+
+  for (let i = 0; i < numCores; i++) {
+    const worker = new Worker(workerUrl);
+    worker.workerId = i;
+    workers.push(worker);
+  }
+
+  // Handle worker messages
+  workers.forEach((worker, index) => {
+    worker.onmessage = function(e) {
+      const { type, nonce, hash, hashes, workerId } = e.data;
+      
+      totalHashes += hashes;
+      
+      if (type === 'solution' && !solved) {
         solved = true;
-        updateStatus(`Solved! Nonce: ${nonce}, Hash: ${hash}`);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const hashRate = Math.round(totalHashes / elapsed);
+        
+        updateStatus(`Solved by core ${workerId}! Nonce: ${nonce}, Hash: ${hash} (${hashRate} H/s)`);
         progressEl.value = 100;
+        
+        // Terminate all workers
+        workers.forEach(w => w.terminate());
+        URL.revokeObjectURL(workerUrl);
+        
         submitSolution(nonce);
         return;
       }
-      nonce++;
-    }
-    progressEl.value = (nonce % 100000) / 1000 % 100;
-    updateStatus(`Trying nonce ${nonce}...`);
-    if (!solved) requestAnimationFrame(solveChunk);
-  }
+      
+      if (type === 'progress' && !solved) {
+        // Update global nonce to the highest processed
+        globalNonce = Math.max(globalNonce, e.data.lastNonce);
+        
+        const elapsed = (Date.now() - startTime) / 1000;
+        const hashRate = elapsed > 0 ? Math.round(totalHashes / elapsed) : 0;
+        
+        progressEl.value = (globalNonce % 100000) / 1000 % 100;
+        updateStatus(`Mining with ${numCores} cores... ${hashRate} H/s (nonce: ${globalNonce})`);
+        
+        // Assign next chunk to this worker
+        const chunkSize = 1000;
+        const startNonce = globalNonce + (workerId * chunkSize);
+        globalNonce += numCores * chunkSize;
+        
+        worker.postMessage({
+          challenge: challenge,
+          difficultyPrefix: difficultyPrefix,
+          startNonce: startNonce,
+          chunkSize: chunkSize,
+          workerId: workerId
+        });
+      }
+    };
+  });
 
   function submitSolution(nonce) {
-    fetch("/", {
+    const params = new URLSearchParams();
+    params.append('nonce', nonce.toString());
+    params.append('token', token);
+    fetch("/post_nonce", {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: "nonce=" + nonce
+      body: params.toString()
     })
     .then(res => {
       if (res.ok) {
         updateStatus(statusEl.textContent + " – Server accepted solution!");
-        window.location.reload();
+        setTimeout(() => {
+          window.location.href = "/validate";
+        }, 1000);
       } else {
         updateStatus(statusEl.textContent + " – Server rejected solution.");
       }
@@ -150,47 +246,153 @@ pub const JS_SCRIPT: &str = r#"
       updateStatus(statusEl.textContent + " – Failed to submit solution.");
     });
   }
-
-  solveChunk();
+  updateStatus(`Starting mining with ${numCores} CPU cores...`);
+  const chunkSize = 1000;
+  workers.forEach((worker, index) => {
+    const startNonce = globalNonce + (index * chunkSize);
+    worker.postMessage({
+      challenge: challenge,
+      difficultyPrefix: difficultyPrefix,
+      startNonce: startNonce,
+      chunkSize: chunkSize,
+      workerId: index
+    });
+  });
+  globalNonce += numCores * chunkSize;
 })();
 "#;
-pub fn get_html_template(challenge: &str) -> String {
-    let sanitized_challenge = encode_text(challenge);
-    format!(
-        r#"<!DOCTYPE html>
+
+pub fn generate_challenge_html(token: &str, challenge: &str, difficulty: usize) -> String {
+	let sanitized_challenge = encode_text(challenge);
+	let sanitized_token = encode_text(token);
+	let difficulty_prefix = "0".repeat(difficulty);
+
+	format!(
+		r#"<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Minimal Proof of Work</title>
-  <style>{style}</style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Minimal Proof of Work</title>
+<style>{style}</style>
 </head>
 <body>
-  <h1>
-    <a href="https://github.com/krzysztofmarciniak/mpow" target="_blank" rel="noopener noreferrer">
-      Minimal Proof of Work Challenge
-    </a>
-  </h1>
-  <p>Challenge string: <code>{challenge}</code></p>
+<h1>
+  <a href="https://github.com/krzysztofmarciniak/mpow" target="_blank" rel="noopener noreferrer">
+    Minimal Proof of Work Challenge
+  </a>
+</h1>
+<p>Challenge string: <code>{challenge}</code></p>
 
-  <div class="atom">
-    <div class="nucleus"></div>
-    <div class="orbit">
-      <div class="electron"></div>
-    </div>
+<div class="atom">
+  <div class="nucleus"></div>
+  <div class="orbit">
+    <div class="electron"></div>
   </div>
+</div>
 
-  <p id="status" aria-live="polite">Solving challenge...</p>
-  <progress id="progress" max="100" value="0" hidden></progress>
+<noscript>You have to have Javascript enabled to complete verification.</noscript>
+<p id="status" aria-live="polite">Solving challenge...</p>
+<progress id="progress" max="100" value="0" hidden></progress>
 
-  <script>
-    const challenge = "{challenge}";
-  </script>
-  <script>{js}</script>
+<script>
+  const challenge = "{challenge}";
+  const token = "{token}";
+  const difficultyPrefix = "{difficulty_prefix}";
+</script>
+<script>{js}</script>
 </body>
 </html>"#,
-        challenge = sanitized_challenge,
-        style = STYLE_CSS,
-        js = JS_SCRIPT,
-    )
+		challenge = sanitized_challenge,
+		token = sanitized_token,
+		difficulty_prefix = difficulty_prefix,
+		style = STYLE_CSS,
+		js = JS_SCRIPT,
+	)
+}
+
+pub fn render_challenge_page(challenge: &str, difficulty: &str) -> String {
+	let sanitized_challenge = encode_text(challenge);
+	let sanitized_difficulty = encode_text(difficulty);
+	format!(
+		r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Minimal Proof of Work</title>
+<style>{style}</style>
+</head>
+<body>
+<h1>
+  <a href="https://github.com/krzysztofmarciniak/mpow" target="_blank" rel="noopener noreferrer">
+    Minimal Proof of Work Challenge
+  </a>
+</h1>
+<p>Challenge string: <code>{challenge}</code></p>
+
+<div class="atom">
+  <div class="nucleus"></div>
+  <div class="orbit">
+    <div class="electron"></div>
+  </div>
+</div>
+
+<noscript>You have to have Javascript enabled to complete verification.</noscript>
+<p id="status" aria-live="polite">Solving challenge...</p>
+<progress id="progress" max="100" value="0" hidden></progress>
+
+<script>
+  const challenge = "{challenge}";
+  const difficultyPrefix = "{difficulty}";
+</script>
+<script>{js}</script>
+</body>
+</html>"#,
+		challenge = sanitized_challenge,
+		difficulty = sanitized_difficulty,
+		style = STYLE_CSS,
+		js = JS_SCRIPT,
+	)
+}
+
+/// Debug helper
+pub fn demo_html() {
+	println!("html module demo called");
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn demo_function_exists_html() {
+		demo_html();
+	}
+
+	#[test]
+	fn test_render_challenge_page() {
+		let challenge = "test_challenge";
+		let difficulty = "00";
+		let rendered = render_challenge_page(challenge, difficulty);
+
+		assert!(rendered.contains("test_challenge"));
+		assert!(rendered.contains("00"));
+		assert!(rendered.contains("<!DOCTYPE html>"));
+		assert!(rendered.contains("<html lang=\"en\">"));
+		assert!(rendered.contains(STYLE_CSS));
+		assert!(rendered.contains(JS_SCRIPT));
+	}
+
+	#[test]
+	fn test_generate_challenge_html() {
+		let token = "test_token";
+		let challenge = "test_challenge";
+		let difficulty = 4;
+		let rendered = generate_challenge_html(token, challenge, difficulty);
+
+		assert!(rendered.contains("test_token"));
+		assert!(rendered.contains("test_challenge"));
+		assert!(rendered.contains("0000"));
+		assert!(rendered.contains("<!DOCTYPE html>"));
+	}
 }
