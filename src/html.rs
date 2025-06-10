@@ -86,94 +86,108 @@ progress {
   accent-color: var(--color-primary);
 }
 "#;
+
 pub const JS_SCRIPT: &str = r#"
 (async () => {
   const statusEl = document.getElementById("status");
   const progressEl = document.getElementById("progress");
   
-  // Detect number of CPU cores
   const numCores = navigator.hardwareConcurrency || 4;
   console.log(`Detected ${numCores} CPU cores`);
-
-  function str2buf(str) {
-    return new TextEncoder().encode(str);
-  }
-
-  async function sha256hex(input) {
-    const hashBuffer = await crypto.subtle.digest("SHA-256", input);
-    return Array.from(new Uint8Array(hashBuffer))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
-  }
 
   let globalNonce = 0;
   let solved = false;
   let totalHashes = 0;
   const startTime = Date.now();
+  let lastUpdateTime = startTime;
   progressEl.hidden = false;
 
-  function updateStatus(text) {
-    statusEl.textContent = text;
-  }
+  const updateStatus = text => statusEl.textContent = text;
 
-  // Worker code as a string to create inline workers
+  // Improved worker code with better buffer management
   const workerCode = `
     self.onmessage = async function(e) {
       const { challenge, difficultyPrefix, startNonce, chunkSize, workerId } = e.data;
       
-      function str2buf(str) {
-        return new TextEncoder().encode(str);
-      }
+      const encoder = new TextEncoder();
+      const challengeBuf = encoder.encode(challenge);
+      const difficultyLen = difficultyPrefix.length;
 
-      async function sha256hex(input) {
-        const hashBuffer = await crypto.subtle.digest("SHA-256", input);
-        return Array.from(new Uint8Array(hashBuffer))
-          .map(b => b.toString(16).padStart(2, '0'))
-          .join('');
-      }
+      // Pre-allocate buffer to avoid repeated allocations
+      const maxNonceLen = 20; // Reasonable max for nonce string length
+      const workBuffer = new Uint8Array(challengeBuf.length + maxNonceLen);
+      workBuffer.set(challengeBuf);
 
       let nonce = startNonce;
       let hashes = 0;
+      const batchSize = 100; // Process in smaller batches for better responsiveness
       
-      for (let i = 0; i < chunkSize; i++) {
-        const input = challenge + nonce.toString();
-        const hash = await sha256hex(str2buf(input));
-        hashes++;
+      while (hashes < chunkSize) {
+        const batchEnd = Math.min(hashes + batchSize, chunkSize);
+        
+        for (let i = hashes; i < batchEnd; i++) {
+          const nonceStr = nonce.toString();
+          const nonceBytes = encoder.encode(nonceStr);
+          workBuffer.set(nonceBytes, challengeBuf.length);
+          
+          const hashBuffer = await crypto.subtle.digest("SHA-256", 
+            workBuffer.subarray(0, challengeBuf.length + nonceBytes.length));
+          
+          // Fast prefix check without string conversion
+          const hashArray = new Uint8Array(hashBuffer);
+          let matches = true;
+          for (let j = 0; j < Math.ceil(difficultyLen / 2); j++) {
+            const byte = hashArray[j];
+            const hex1 = (byte >> 4).toString(16);
+            const hex2 = (byte & 0xf).toString(16);
+            
+            if (j * 2 < difficultyLen && hex1 !== difficultyPrefix[j * 2]) {
+              matches = false;
+              break;
+            }
+            if (j * 2 + 1 < difficultyLen && hex2 !== difficultyPrefix[j * 2 + 1]) {
+              matches = false;
+              break;
+            }
+          }
 
-        if (hash.startsWith(difficultyPrefix)) {
-          self.postMessage({ 
-            type: 'solution', 
-            nonce: nonce, 
-            hash: hash, 
-            hashes: hashes,
-            workerId: workerId 
-          });
-          return;
+          if (matches) {
+            // Only convert to hex string when we have a match
+            const hash = Array.from(hashArray)
+              .map(b => b.toString(16).padStart(2, '0'))
+              .join('');
+            
+            self.postMessage({ type: 'solution', nonce, hash, hashes: hashes + 1, workerId });
+            return;
+          }
+          nonce++;
         }
-        nonce++;
+        
+        hashes = batchEnd;
+        
+        // Yield control periodically
+        if (hashes % (batchSize * 10) === 0) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
       }
 
-      self.postMessage({ 
-        type: 'progress', 
-        lastNonce: nonce, 
-        hashes: hashes,
-        workerId: workerId 
-      });
+      self.postMessage({ type: 'progress', lastNonce: nonce, hashes, workerId });
     };
   `;
 
-  // Create workers
-  const workers = [];
   const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
   const workerUrl = URL.createObjectURL(workerBlob);
-
-  for (let i = 0; i < numCores; i++) {
+  const workers = Array.from({ length: numCores }, (_, i) => {
     const worker = new Worker(workerUrl);
     worker.workerId = i;
-    workers.push(worker);
-  }
+    return worker;
+  });
 
-  // Handle worker messages
+  // Adaptive chunk size based on performance
+  let chunkSize = 5000;
+  const minChunkSize = 1000;
+  const maxChunkSize = 50000;
+
   workers.forEach((worker, index) => {
     worker.onmessage = function(e) {
       const { type, nonce, hash, hashes, workerId } = e.data;
@@ -185,10 +199,9 @@ pub const JS_SCRIPT: &str = r#"
         const elapsed = (Date.now() - startTime) / 1000;
         const hashRate = Math.round(totalHashes / elapsed);
         
-        updateStatus(`Solved by core ${workerId}! Nonce: ${nonce}, Hash: ${hash} (${hashRate} H/s)`);
+        updateStatus(`✅ Solved by core ${workerId}! Nonce: ${nonce} (${hashRate.toLocaleString()} H/s)`);
         progressEl.value = 100;
         
-        // Terminate all workers
         workers.forEach(w => w.terminate());
         URL.revokeObjectURL(workerUrl);
         
@@ -197,69 +210,95 @@ pub const JS_SCRIPT: &str = r#"
       }
       
       if (type === 'progress' && !solved) {
-        // Update global nonce to the highest processed
         globalNonce = Math.max(globalNonce, e.data.lastNonce);
         
-        const elapsed = (Date.now() - startTime) / 1000;
-        const hashRate = elapsed > 0 ? Math.round(totalHashes / elapsed) : 0;
+        // Throttle UI updates to improve performance
+        const now = Date.now();
+          const elapsed = (now - startTime) / 1000;
+          const hashRate = elapsed > 0 ? Math.round(totalHashes / elapsed) : 0;
+          
+          // Adaptive chunk size based on hash rate
+          if (hashRate > 0) {
+            if (hashRate < 1000 && chunkSize > minChunkSize) {
+              chunkSize = Math.max(minChunkSize, chunkSize * 0.8);
+            } else if (hashRate > 5000 && chunkSize < maxChunkSize) {
+              chunkSize = Math.min(maxChunkSize, chunkSize * 1.2);
+            }
+          }
+          
+          progressEl.value = (globalNonce % 100000) / 1000 % 100;
+          updateStatus(`⚡ Mining with ${numCores} cores... ${hashRate.toLocaleString()} H/s (nonce: ${globalNonce.toLocaleString()})`);
+          lastUpdateTime = now;
         
-        progressEl.value = (globalNonce % 100000) / 1000 % 100;
-        updateStatus(`Mining with ${numCores} cores... ${hashRate} H/s (nonce: ${globalNonce})`);
         
-        // Assign next chunk to this worker
-        const chunkSize = 1000;
         const startNonce = globalNonce + (workerId * chunkSize);
         globalNonce += numCores * chunkSize;
         
         worker.postMessage({
-          challenge: challenge,
-          difficultyPrefix: difficultyPrefix,
-          startNonce: startNonce,
-          chunkSize: chunkSize,
-          workerId: workerId
+          challenge,
+          difficultyPrefix,
+          startNonce,
+          chunkSize: Math.floor(chunkSize),
+          workerId
         });
       }
     };
   });
 
-  function submitSolution(nonce) {
-    const params = new URLSearchParams();
-    params.append('nonce', nonce.toString());
-    params.append('token', token);
-    fetch("/post_nonce", {
-      method: "POST",
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: params.toString()
-    })
-    .then(res => {
+  async function submitSolution(nonce) {
+    try {
+      updateStatus(statusEl.textContent + " 📤 Submitting...");
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+      
+      const params = new URLSearchParams();
+      params.append('nonce', nonce.toString());
+      params.append('token', token);
+      
+      const res = await fetch("/post_nonce", {
+        method: "POST",
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: params.toString(),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
       if (res.ok) {
-        updateStatus(statusEl.textContent + " – Server accepted solution!");
-        setTimeout(() => {
-          window.location.href = "/validate";
-        }, 1000);
+        updateStatus(statusEl.textContent.replace("📤 Submitting...", "") + " ✅ Server accepted!");
+        setTimeout(() => window.location.href = "/validate", 1500);
       } else {
-        updateStatus(statusEl.textContent + " – Server rejected solution.");
+        const errorText = await res.text().catch(() => 'Unknown error');
+        updateStatus(statusEl.textContent.replace("📤 Submitting...", "") + ` ❌ Server rejected: ${errorText}`);
       }
-    }).catch(() => {
-      updateStatus(statusEl.textContent + " – Failed to submit solution.");
-    });
+    } catch (error) {
+      const message = error.name === 'AbortError' ? 'Request timeout' : 'Network error';
+      updateStatus(statusEl.textContent.replace("📤 Submitting...", "") + ` ❌ ${message}`);
+    }
   }
-  updateStatus(`Starting mining with ${numCores} CPU cores...`);
-  const chunkSize = 1000;
+
+  // Graceful shutdown on page unload
+  window.addEventListener('beforeunload', () => {
+    workers.forEach(w => w.terminate());
+    URL.revokeObjectURL(workerUrl);
+  });
+
+  updateStatus(`🚀 Starting mining with ${numCores} CPU cores...`);
   workers.forEach((worker, index) => {
-    const startNonce = globalNonce + (index * chunkSize);
     worker.postMessage({
-      challenge: challenge,
-      difficultyPrefix: difficultyPrefix,
-      startNonce: startNonce,
-      chunkSize: chunkSize,
+      challenge,
+      difficultyPrefix,
+      startNonce: globalNonce + (index * chunkSize),
+      chunkSize: Math.floor(chunkSize),
       workerId: index
     });
   });
   globalNonce += numCores * chunkSize;
-})();
+})().catch(error => {
+  console.error('Mining error:', error);
+  document.getElementById("status").textContent = `❌ Error: ${error.message}`;
+});
 "#;
 
 pub fn generate_challenge_html(token: &str, challenge: &str, difficulty: usize) -> String {

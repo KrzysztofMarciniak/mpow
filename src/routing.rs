@@ -142,7 +142,7 @@ async fn handle_post_nonce(
 
 	response
 		.headers_mut()
-		.insert("refresh", "2; url=/".parse().unwrap());
+		.insert("refresh", "2; url=/validate".parse().unwrap());
 
 	Ok(response)
 }
@@ -201,7 +201,6 @@ mod tests {
 		body::Body,
 		http::{header, Method, Request},
 	};
-	use std::collections::HashMap;
 	use tower::ServiceExt;
 
 	#[tokio::test]
@@ -271,7 +270,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_validate_with_valid_jwt() {
 		let state = AppState::new();
-		let jwt_token = crate::jwt::issue_jwt("test_user", &state.jwt_secret).unwrap();
+		let jwt_token = issue_jwt("test_user", &state.jwt_secret).unwrap();
 		let cookie_value = format!("{}={}", COOKIE_NAME, jwt_token);
 
 		let app = Router::new()
@@ -373,13 +372,286 @@ mod tests {
 
 		assert_eq!(response.status(), StatusCode::OK);
 
+		// Check that Set-Cookie header is present
 		let set_cookie_header = response.headers().get("set-cookie");
 		assert!(set_cookie_header.is_some());
 		let cookie_str = set_cookie_header.unwrap().to_str().unwrap();
 		assert!(cookie_str.contains(COOKIE_NAME));
 
+		// Check that refresh header points to /validate
 		let refresh_header = response.headers().get("refresh");
 		assert!(refresh_header.is_some());
 		assert_eq!(refresh_header.unwrap().to_str().unwrap(), "2; url=/validate");
+	}
+
+	#[tokio::test]
+	async fn test_challenge_expiry() {
+		let state = AppState::new();
+		let token = "expired_token";
+		let challenge = "expired_challenge";
+
+		// Create an expired challenge (created_at is way in the past)
+		let expired_challenge = Challenge {
+			token: token.to_string(),
+			challenge: challenge.to_string(),
+			created_at: current_timestamp() - CHALLENGE_EXPIRY_SECS - 1,
+			attempts: 0,
+		};
+
+		{
+			let mut challenges = state.challenges.lock().unwrap();
+			challenges.insert(token.to_string(), expired_challenge);
+		}
+
+		let app = Router::new()
+			.route("/post_nonce", post(handle_post_nonce))
+			.with_state(state);
+
+		let form_data = format!("nonce=123&token={}", token);
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri("/post_nonce")
+			.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(Body::from(form_data))
+			.unwrap();
+
+		let response = app.oneshot(request).await.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.unwrap();
+		let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+		assert_eq!(body_str, "Challenge expired");
+	}
+
+	#[tokio::test]
+	async fn test_too_many_attempts() {
+		let state = AppState::new();
+		let token = "max_attempts_token";
+		let challenge = "max_attempts_challenge";
+
+		// Create a challenge with maximum attempts
+		let max_attempts_challenge = Challenge {
+			token: token.to_string(),
+			challenge: challenge.to_string(),
+			created_at: current_timestamp(),
+			attempts: MAX_ATTEMPTS,
+		};
+
+		{
+			let mut challenges = state.challenges.lock().unwrap();
+			challenges.insert(token.to_string(), max_attempts_challenge);
+		}
+
+		let app = Router::new()
+			.route("/post_nonce", post(handle_post_nonce))
+			.with_state(state);
+
+		let form_data = format!("nonce=123&token={}", token);
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri("/post_nonce")
+			.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(Body::from(form_data))
+			.unwrap();
+
+		let response = app.oneshot(request).await.unwrap();
+
+		assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.unwrap();
+		let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+		assert_eq!(body_str, "Too many attempts");
+	}
+
+	#[tokio::test]
+	async fn test_invalid_nonce() {
+		let state = AppState::new();
+		let token = "invalid_nonce_token";
+		let challenge = "invalid_nonce_challenge";
+
+		let valid_challenge = Challenge {
+			token: token.to_string(),
+			challenge: challenge.to_string(),
+			created_at: current_timestamp(),
+			attempts: 0,
+		};
+
+		{
+			let mut challenges = state.challenges.lock().unwrap();
+			challenges.insert(token.to_string(), valid_challenge);
+		}
+
+		let app = Router::new()
+			.route("/post_nonce", post(handle_post_nonce))
+			.with_state(state);
+
+		// Use a nonce that definitely won't produce the required hash
+		let form_data = format!("nonce=999999999&token={}", token);
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri("/post_nonce")
+			.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(Body::from(form_data))
+			.unwrap();
+
+		let response = app.oneshot(request).await.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.unwrap();
+		let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+		assert_eq!(body_str, "Invalid nonce");
+	}
+
+	#[tokio::test]
+	async fn test_extract_token_from_cookie() {
+		// Test with valid cookie
+		let cookie_str = format!("{}=test_token_value; other=value", COOKIE_NAME);
+		let token = extract_token_from_cookie(&cookie_str);
+		assert_eq!(token, Some("test_token_value".to_string()));
+
+		// Test with multiple cookies
+		let cookie_str = format!("first=value1; {}=test_token; last=value2", COOKIE_NAME);
+		let token = extract_token_from_cookie(&cookie_str);
+		assert_eq!(token, Some("test_token".to_string()));
+
+		// Test with no matching cookie
+		let cookie_str = "other=value; another=value2";
+		let token = extract_token_from_cookie(&cookie_str);
+		assert_eq!(token, None);
+
+		// Test with empty string
+		let token = extract_token_from_cookie("");
+		assert_eq!(token, None);
+	}
+
+	#[tokio::test]
+	async fn test_validate_with_invalid_jwt() {
+		let state = AppState::new();
+		let invalid_jwt = "invalid.jwt.token";
+		let cookie_value = format!("{}={}", COOKIE_NAME, invalid_jwt);
+
+		let app = Router::new()
+			.route("/validate", get(handle_validate))
+			.with_state(state);
+
+		let request = Request::builder()
+			.method(Method::GET)
+			.uri("/validate")
+			.header(header::COOKIE, cookie_value)
+			.body(Body::empty())
+			.unwrap();
+
+		let response = app.oneshot(request).await.unwrap();
+
+		assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.unwrap();
+		let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+		assert_eq!(body_str, "Unauthorized. Redirecting to challenge...");
+	}
+
+	#[tokio::test]
+	async fn test_challenge_cleanup_after_success() {
+		let state = AppState::new();
+		let token = "cleanup_token";
+		let challenge = "cleanup_challenge";
+
+		let valid_challenge = Challenge {
+			token: token.to_string(),
+			challenge: challenge.to_string(),
+			created_at: current_timestamp(),
+			attempts: 0,
+		};
+
+		{
+			let mut challenges = state.challenges.lock().unwrap();
+			challenges.insert(token.to_string(), valid_challenge);
+		}
+
+		let valid_nonce = find_valid_nonce(challenge, POW_DIFFICULTY_PREFIX);
+
+		let app = Router::new()
+			.route("/post_nonce", post(handle_post_nonce))
+			.with_state(state.clone());
+
+		let form_data = format!("nonce={}&token={}", valid_nonce, token);
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri("/post_nonce")
+			.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(Body::from(form_data))
+			.unwrap();
+
+		let response = app.oneshot(request).await.unwrap();
+
+		assert_eq!(response.status(), StatusCode::OK);
+
+		// Verify that the challenge was removed from the map
+		{
+			let challenges = state.challenges.lock().unwrap();
+			assert!(!challenges.contains_key(token));
+		}
+	}
+
+	#[tokio::test]
+	async fn test_attempt_increment() {
+		let state = AppState::new();
+		let token = "attempt_token";
+		let challenge = "attempt_challenge";
+
+		let valid_challenge = Challenge {
+			token: token.to_string(),
+			challenge: challenge.to_string(),
+			created_at: current_timestamp(),
+			attempts: 0,
+		};
+
+		{
+			let mut challenges = state.challenges.lock().unwrap();
+			challenges.insert(token.to_string(), valid_challenge);
+		}
+
+		let app = Router::new()
+			.route("/post_nonce", post(handle_post_nonce))
+			.with_state(state.clone());
+
+		// Submit an invalid nonce
+		let form_data = format!("nonce=invalid_nonce&token={}", token);
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri("/post_nonce")
+			.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(Body::from(form_data))
+			.unwrap();
+
+		let response = app.oneshot(request).await.unwrap();
+
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+		// Verify that attempts were incremented
+		{
+			let challenges = state.challenges.lock().unwrap();
+			let challenge = challenges.get(token).unwrap();
+			assert_eq!(challenge.attempts, 1);
+		}
 	}
 }
